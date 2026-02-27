@@ -80,7 +80,7 @@ TOKEN_ID_MIN = 25
 TOKEN_ID_MAX = 1024
 
 # LLM Config - ВСТАВЬ СВОЙ КЛЮЧ
-LLM_API_KEY = "Замени на свой OpenRouter ключ"  # <-- Замени на свой OpenRouter ключ
+LLM_API_KEY = "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"  # <-- Замени на свой OpenRouter ключ
 LLM_BASE_URL = "https://openrouter.ai/api/v1"
 LLM_MODEL = "openai/gpt-4o-mini"
 
@@ -101,6 +101,7 @@ class SharedState:
     def __init__(self):
         self.tried_tokens: Set[int] = set()   # глобально занятые
         self.free_tokens: List[int] = []       # известные свободные (пробуем первыми)
+        self.moment_states: Dict[str, dict] = {}  # account_id → {posted, last_post}
 
     def mark_taken(self, token_id: int):
         self.tried_tokens.add(token_id)
@@ -121,12 +122,22 @@ class SharedState:
             return None
         return random.choice(available)
 
+    def save_moment_state(self, account_id: str, posted: int, last_post: Optional[datetime]):
+        self.moment_states[account_id] = {
+            "posted": posted,
+            "last_post": last_post.isoformat() if last_post else None
+        }
+
+    def get_moment_state(self, account_id: str) -> dict:
+        return self.moment_states.get(account_id, {})
+
     def save(self):
         try:
             with open(STATE_FILE, "w") as f:
                 json.dump({
                     "tried_tokens": list(self.tried_tokens),
                     "free_tokens": self.free_tokens,
+                    "moment_states": self.moment_states,
                     "saved_at": datetime.now().isoformat()
                 }, f)
         except Exception as e:
@@ -141,9 +152,11 @@ class SharedState:
                 data = json.load(f)
             self.tried_tokens = set(data.get("tried_tokens", []))
             self.free_tokens = data.get("free_tokens", [])
+            self.moment_states = data.get("moment_states", {})
             saved_at = data.get("saved_at", "unknown")
             print(f"📂 State loaded (saved {saved_at}): "
-                  f"{len(self.tried_tokens)} taken, {len(self.free_tokens)} free tokens")
+                  f"{len(self.tried_tokens)} taken, {len(self.free_tokens)} free tokens, "
+                  f"{len(self.moment_states)} moment states")
         except Exception as e:
             print(f"⚠️ Could not load state: {e}")
 
@@ -452,6 +465,8 @@ class AccountFarmer:
             self.stats.moments_posted = self.moments.posted
             self.stats.last_moment = datetime.now().isoformat()
             print(f"[{self.id}] ✅ Moment posted! +{result['trust_earned']} trust ({self.moments.posted}/{MAX_MOMENTS})")
+            # Сохраняем стейт моментов сразу после поста
+            self.shared.save_moment_state(self.id, self.moments.posted, self.moments.last_post)
 
         # Обновляем время следующего момента
         next_time = self.moments.get_next_post_time()
@@ -472,6 +487,11 @@ class AccountFarmer:
         result = self.client.post(API_INSCRIBE, {"token_id": token_id})
 
         # 3. Проверяем ответ
+
+        # Случай 0: Серверная ошибка (5xx)
+        if result.get("status", 0) in (500, 502, 503, 504):
+            print(f"[{self.id}] 🌐 Server error {result['status']}, retrying in 60s...")
+            return {"success": False, "error": "server_error", "retry_after": 60}
 
         # Случай 1: Токен занят
         if result.get("id_status") == "taken":
@@ -534,6 +554,12 @@ class AccountFarmer:
         })
 
         # Проверяем результат
+
+        # Серверная ошибка (5xx)
+        if result.get("status", 0) in (500, 502, 503, 504):
+            print(f"[{self.id}] 🌐 Server error {result['status']} on challenge, retrying in 60s...")
+            return {"success": False, "error": "server_error", "retry_after": 60}
+
         if result.get("hash") or result.get("cw_earned"):
             self.shared.mark_free(token_id)  # остальные тоже могут его майнить
             self.stats.challenges_passed += 1
@@ -564,6 +590,17 @@ class AccountFarmer:
 
         print(f"[{self.id}] 🚀 Starting farmer...")
 
+        # Восстанавливаем состояние моментов из сохранённого стейта
+        m_state = self.shared.get_moment_state(self.id)
+        if m_state:
+            self.moments.posted = m_state.get("posted", 0)
+            last_post_str = m_state.get("last_post")
+            if last_post_str:
+                self.moments.last_post = datetime.fromisoformat(last_post_str)
+            self.stats.moments_posted = self.moments.posted
+            print(f"[{self.id}] 📅 Moments restored: {self.moments.posted}/{MAX_MOMENTS}"
+                  + (f", last post {self.moments.last_post.strftime('%H:%M')}" if self.moments.last_post else ""))
+
         # Получаем начальный статус
         await self.get_balance()
         print(f"[{self.id}] 📊 Trust: {self.stats.trust_score}/{TRUST_TARGET} | CW: {self.stats.cw_balance:,}")
@@ -593,7 +630,13 @@ class AccountFarmer:
                 if result.get("error") == "rate_limited":
                     retry = result.get("retry_after", 60)
                     print(f"[{self.id}] 🔒 Rate limited, sleeping {retry}s...")
-                    await asyncio.sleep(retry + random.randint(10, 30))  # <-- добавить jitter
+                    await asyncio.sleep(retry + random.randint(10, 30))
+                    continue
+
+                if result.get("error") == "server_error":
+                    retry = result.get("retry_after", 60)
+                    print(f"[{self.id}] 🌐 Server unavailable, sleeping {retry}s...")
+                    await asyncio.sleep(retry)
                     continue
 
                 if result.get("success"):
