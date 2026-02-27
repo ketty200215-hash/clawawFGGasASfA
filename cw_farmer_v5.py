@@ -80,7 +80,7 @@ TOKEN_ID_MIN = 25
 TOKEN_ID_MAX = 1024
 
 # LLM Config - ВСТАВЬ СВОЙ КЛЮЧ
-LLM_API_KEY = "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"  # <-- Замени на свой OpenRouter ключ
+LLM_API_KEY = "Замени на свой OpenRouter ключ"  # <-- Замени на свой OpenRouter ключ
 LLM_BASE_URL = "https://openrouter.ai/api/v1"
 LLM_MODEL = "openai/gpt-4o-mini"
 
@@ -287,30 +287,66 @@ class LLMClient:
         """Проверить и исправить ответ под числовые ограничения"""
         import re
 
-        # Ограничение на количество слов: "between X and Y words"
+        # "exactly X words"
+        m = re.search(r'exactly\s+(\d+)\s+words', prompt, re.IGNORECASE)
+        if m:
+            n = int(m.group(1))
+            words = answer.split()
+            if len(words) > n:
+                answer = " ".join(words[:n])
+
+        # "between X and Y words"
         m = re.search(r'between\s+(\d+)\s+and\s+(\d+)\s+words', prompt, re.IGNORECASE)
         if m:
-            lo, hi = int(m.group(1)), int(m.group(2))
+            hi = int(m.group(2))
             words = answer.split()
             if len(words) > hi:
                 answer = " ".join(words[:hi])
-            # Если меньше минимума — ничего не делаем, LLM промахнулся
+
         return answer
 
+    @staticmethod
+    def _build_prompt(prompt: str):
+        """Собрать system + user промпт в зависимости от типа challenge"""
+        import re
+
+        is_paraphrase = bool(re.search(r"say this in different words", prompt, re.IGNORECASE))
+        is_exact_words = bool(re.search(r"exactly\s+\d+\s+words", prompt, re.IGNORECASE))
+        is_between_words = bool(re.search(r"between\s+\d+\s+and\s+\d+\s+words", prompt, re.IGNORECASE))
+
+        if is_paraphrase:
+            system = (
+                "Rewrite the given sentence using completely different words while keeping the same meaning. "
+                "Do NOT reuse any nouns, verbs, or adjectives from the original. "
+                "Output ONLY the rewritten sentence — no quotes, no explanation."
+            )
+            user = f"{prompt}\n\nYour rewrite (use entirely different vocabulary):"
+
+        elif is_exact_words or is_between_words:
+            system = (
+                "You are solving word-count challenges. "
+                "CRITICAL: count every word in your answer BEFORE outputting it. "
+                "Output ONLY the answer — no quotes, no labels."
+            )
+            user = f"{prompt}\n\nCount your words carefully. Output only the answer:"
+
+        else:
+            system = (
+                "You are solving writing challenges. Follow ALL constraints EXACTLY.\n"
+                "- Include ALL required words if mentioned.\n"
+                "- End with '?' if asked for a question.\n"
+                "- Start with the required word if specified.\n"
+                "Output ONLY the answer — no quotes, no labels, no explanation."
+            )
+            user = f"{prompt}\n\nYour answer:"
+
+        return system, user
+
     def solve_challenge(self, prompt: str) -> str:
-        """Решить challenge через LLM"""
+        """Решить challenge через LLM, с 1 повтором при таймауте"""
+        import re
 
-        system_prompt = """You are solving word challenges. Follow ALL constraints EXACTLY.
-
-MANDATORY RULES:
-- If the challenge says "between X and Y words": your answer MUST have between X and Y words. Count every word before submitting.
-- If the challenge says "includes 'word'": that exact word MUST appear in your answer.
-- Write naturally but NEVER violate numeric constraints.
-- Output ONLY the answer text — no quotes, no labels, no explanation."""
-
-        user_prompt = f"""Challenge: {prompt}
-
-Count your words carefully before answering. Output only the answer:"""
+        system_prompt, user_prompt = self._build_prompt(prompt)
 
         data = {
             "model": self.model,
@@ -329,23 +365,28 @@ Count your words carefully before answering. Output only the answer:"""
             "X-Title": "CW Farmer"
         }
 
-        req = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
-            data=json.dumps(data).encode(),
-            headers=headers,
-            method="POST"
-        )
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request(
+                    f"{self.base_url}/chat/completions",
+                    data=json.dumps(data).encode(),
+                    headers=headers,
+                    method="POST"
+                )
+                response = urllib.request.urlopen(req, timeout=30)
+                result = json.loads(response.read().decode())
+                answer = result["choices"][0]["message"]["content"].strip()
+                answer = self._validate_answer(prompt, answer)
+                self.request_count += 1
+                return answer
+            except Exception as e:
+                if attempt == 0:
+                    print(f"[LLM] Error (retry): {e}")
+                    time.sleep(5)
+                else:
+                    print(f"[LLM] Error: {e}")
 
-        try:
-            response = urllib.request.urlopen(req, timeout=60)
-            result = json.loads(response.read().decode())
-            answer = result["choices"][0]["message"]["content"].strip()
-            answer = self._validate_answer(prompt, answer)
-            self.request_count += 1
-            return answer
-        except Exception as e:
-            print(f"[LLM] Error: {e}")
-            return self._fallback_answer(prompt)
+        return self._fallback_answer(prompt)
 
     def _fallback_answer(self, prompt: str) -> str:
         """Fallback если LLM не ответил"""
@@ -540,11 +581,15 @@ class AccountFarmer:
             print(f"[{self.id}] ❌ Invalid challenge format: {challenge_response}")
             return {"success": False, "error": "invalid_challenge"}
 
-        print(f"[{self.id}] 🧩 Challenge required: {prompt[:60]}...")
+        print(f"[{self.id}] 🧩 Challenge: {prompt}")
+        print(f"[{self.id}] 📋 Challenge data: {challenge}")
 
-        # Решаем через LLM
-        answer = self.llm.solve_challenge(prompt)
-        print(f"[{self.id}] 🤖 LLM answer: {answer[:50]}...")
+        # Решаем через LLM (в executor — не блокирует event loop)
+        loop = asyncio.get_running_loop()
+        answer = await loop.run_in_executor(None, self.llm.solve_challenge, prompt)
+        # Чистим ответ: убираем кавычки, лишние переносы
+        answer = answer.strip().strip('"').strip("'").strip()
+        print(f"[{self.id}] 🤖 LLM answer: {answer}")
 
         # Отправляем ответ
         result = self.client.post(API_INSCRIBE, {
@@ -573,7 +618,7 @@ class AccountFarmer:
 
         if result.get("error") == "CHALLENGE_FAILED":
             self.stats.challenges_failed += 1
-            print(f"[{self.id}] ❌ Challenge failed (bad answer)")
+            print(f"[{self.id}] ❌ Challenge failed | answer: '{answer}' | server: {result}")
             return {"success": False, "error": "challenge_failed"}
 
         if result.get("error") == "CHALLENGE_USED":
@@ -652,7 +697,11 @@ class AccountFarmer:
                 if result.get("challenge_cooldown"):
                     wait = random.randint(1860, 1920)
                     print(f"[{self.id}] ⏳ Challenge cooldown: sleeping {wait // 60}m {wait % 60}s...")
-                    await asyncio.sleep(wait)
+                    try:
+                        await asyncio.sleep(wait)
+                    except asyncio.CancelledError:
+                        if not self.running:
+                            raise
                     continue
 
                 # Ждём перед следующим циклом
