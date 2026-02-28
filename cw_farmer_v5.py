@@ -191,6 +191,7 @@ class AccountStats:
     id: str
     trust_score: int = 0
     cw_balance: int = 0
+    cw_staked: int = 0
     total_mines: int = 0
     moments_posted: int = 0
     challenges_passed: int = 0
@@ -207,6 +208,8 @@ class AccountStats:
             "id": self.id,
             "trust_score": self.trust_score,
             "cw_balance": self.cw_balance,
+            "cw_staked": self.cw_staked,
+            "stake_ok": self.cw_staked >= 20000,
             "total_mines": self.total_mines,
             "moments_posted": self.moments_posted,
             "moments_remaining": MAX_MOMENTS - self.moments_posted,
@@ -234,23 +237,19 @@ class HttpClient:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
 
-    def request(self, url: str, data: dict = None, method: str = "POST", timeout: int = 30) -> dict:
-        """Выполнить HTTP запрос"""
-        body = json.dumps(data).encode() if data else b""
-
-        req = urllib.request.Request(url, data=body, headers=self.headers.copy(), method=method)
-        req.add_header("X-API-Key", self.api_key)
-
-        # Proxy setup
+    def _build_opener(self):
+        """Создать opener с прокси (или без)"""
         if self.proxy:
             proxy_handler = urllib.request.ProxyHandler({
                 "http": self.proxy,
                 "https": self.proxy
             })
-            opener = urllib.request.build_opener(proxy_handler)
-        else:
-            opener = urllib.request.build_opener()
+            return urllib.request.build_opener(proxy_handler)
+        return urllib.request.build_opener()
 
+    def _execute(self, req: urllib.request.Request, timeout: int = 30) -> dict:
+        """Выполнить запрос и вернуть JSON"""
+        opener = self._build_opener()
         try:
             response = opener.open(req, timeout=timeout)
             return json.loads(response.read().decode())
@@ -262,6 +261,13 @@ class HttpClient:
                 return {"error": str(e), "status": e.code}
         except Exception as e:
             return {"error": str(e)}
+
+    def request(self, url: str, data: dict = None, method: str = "POST", timeout: int = 30) -> dict:
+        """Выполнить HTTP запрос с X-API-Key (агентский ключ)"""
+        body = json.dumps(data).encode() if data else b""
+        req = urllib.request.Request(url, data=body, headers=self.headers.copy(), method=method)
+        req.add_header("X-API-Key", self.api_key)
+        return self._execute(req, timeout)
 
     def post(self, url: str, data: dict) -> dict:
         return self.request(url, data, method="POST")
@@ -305,8 +311,21 @@ class LLMClient:
 
         return answer
 
+    # Стили — каждый аккаунт получает свой по индексу
+    STYLES = [
+        "poetic and lyrical",
+        "casual and conversational",
+        "formal and academic",
+        "vivid and descriptive",
+        "philosophical and reflective",
+        "simple and direct",
+        "scientific and precise",
+        "whimsical and imaginative",
+        "enthusiastic and energetic",
+    ]
+
     @staticmethod
-    def _build_prompt(prompt: str):
+    def _build_prompt(prompt: str, style: str = "natural"):
         """Собрать system + user промпт в зависимости от типа challenge"""
         import re
 
@@ -314,39 +333,42 @@ class LLMClient:
         is_exact_words = bool(re.search(r"exactly\s+\d+\s+words", prompt, re.IGNORECASE))
         is_between_words = bool(re.search(r"between\s+\d+\s+and\s+\d+\s+words", prompt, re.IGNORECASE))
 
+        style_note = f"Write in a {style} style. Your answer must be unique and unlike any other response."
+
         if is_paraphrase:
             system = (
-                "Rewrite the given sentence using completely different words while keeping the same meaning. "
-                "Do NOT reuse any nouns, verbs, or adjectives from the original. "
-                "Output ONLY the rewritten sentence — no quotes, no explanation."
+                f"Rewrite the given sentence using completely different words while keeping the same meaning. "
+                f"Do NOT reuse any nouns, verbs, or adjectives from the original. {style_note} "
+                f"Output ONLY the rewritten sentence — no quotes, no explanation."
             )
-            user = f"{prompt}\n\nYour rewrite (use entirely different vocabulary):"
+            user = f"{prompt}\n\nYour unique rewrite (entirely different vocabulary):"
 
         elif is_exact_words or is_between_words:
             system = (
-                "You are solving word-count challenges. "
-                "CRITICAL: count every word in your answer BEFORE outputting it. "
-                "Output ONLY the answer — no quotes, no labels."
+                f"You are solving word-count challenges. "
+                f"CRITICAL: count every word in your answer BEFORE outputting it. "
+                f"{style_note} Output ONLY the answer — no quotes, no labels."
             )
             user = f"{prompt}\n\nCount your words carefully. Output only the answer:"
 
         else:
             system = (
-                "You are solving writing challenges. Follow ALL constraints EXACTLY.\n"
-                "- Include ALL required words if mentioned.\n"
-                "- End with '?' if asked for a question.\n"
-                "- Start with the required word if specified.\n"
-                "Output ONLY the answer — no quotes, no labels, no explanation."
+                f"You are solving writing challenges. Follow ALL constraints EXACTLY.\n"
+                f"- Include ALL required words if mentioned.\n"
+                f"- End with '?' if asked for a question.\n"
+                f"- Start with the required word if specified.\n"
+                f"{style_note}\n"
+                f"Output ONLY the answer — no quotes, no labels, no explanation."
             )
-            user = f"{prompt}\n\nYour answer:"
+            user = f"{prompt}\n\nYour unique answer:"
 
         return system, user
 
-    def solve_challenge(self, prompt: str) -> str:
+    def solve_challenge(self, prompt: str, style: str = "natural") -> str:
         """Решить challenge через LLM, с 1 повтором при таймауте"""
         import re
 
-        system_prompt, user_prompt = self._build_prompt(prompt)
+        system_prompt, user_prompt = self._build_prompt(prompt, style)
 
         data = {
             "model": self.model,
@@ -478,6 +500,9 @@ class AccountFarmer:
         self.moments = MomentsManager(self.client)
         self.stats = AccountStats(id=self.id)
         self.running = False
+        # Уникальный стиль ответов — по индексу аккаунта
+        idx = int(account_id.split("_")[-1]) - 1
+        self.style = LLMClient.STYLES[idx % len(LLMClient.STYLES)]
 
     def get_next_token_id(self) -> Optional[int]:
         """Получить следующий token_id через SharedState"""
@@ -491,8 +516,10 @@ class AccountFarmer:
             data = result.get("data", {})
             self.stats.trust_score = data.get("trust_score", 0)
             self.stats.cw_balance = data.get("cw_balance", 0)
+            self.stats.cw_staked = data.get("cw_staked", 0)
 
         return result
+
 
     async def post_moment(self) -> dict:
         """Запостить момент если можно"""
@@ -570,7 +597,7 @@ class AccountFarmer:
         print(f"[{self.id}] ❌ Unknown response: {result}")
         return result
 
-    async def handle_challenge(self, token_id: int, challenge_response: dict) -> dict:
+    async def handle_challenge(self, token_id: int, challenge_response: dict, depth: int = 0) -> dict:
         """Обработать CHALLENGE_REQUIRED"""
 
         challenge = challenge_response.get("challenge", {})
@@ -586,7 +613,7 @@ class AccountFarmer:
 
         # Решаем через LLM (в executor — не блокирует event loop)
         loop = asyncio.get_running_loop()
-        answer = await loop.run_in_executor(None, self.llm.solve_challenge, prompt)
+        answer = await loop.run_in_executor(None, self.llm.solve_challenge, prompt, self.style)
         # Чистим ответ: убираем кавычки, лишние переносы
         answer = answer.strip().strip('"').strip("'").strip()
         print(f"[{self.id}] 🤖 LLM answer: {answer}")
@@ -618,7 +645,13 @@ class AccountFarmer:
 
         if result.get("error") == "CHALLENGE_FAILED":
             self.stats.challenges_failed += 1
-            print(f"[{self.id}] ❌ Challenge failed | answer: '{answer}' | server: {result}")
+            msg = result.get("message", "bad answer")
+            print(f"[{self.id}] ❌ Challenge failed ({msg}) | answer: '{answer}'")
+            # Сервер может вернуть новый challenge — пробуем сразу (макс 3 раза)
+            new_ch = result.get("challenge")
+            if new_ch and new_ch.get("id") and new_ch.get("prompt") and depth < 3:
+                print(f"[{self.id}] 🔄 Server gave new challenge, trying immediately (depth={depth+1})...")
+                return await self.handle_challenge(token_id, {"challenge": new_ch}, depth + 1)
             return {"success": False, "error": "challenge_failed"}
 
         if result.get("error") == "CHALLENGE_USED":
@@ -648,7 +681,7 @@ class AccountFarmer:
 
         # Получаем начальный статус
         await self.get_balance()
-        print(f"[{self.id}] 📊 Trust: {self.stats.trust_score}/{TRUST_TARGET} | CW: {self.stats.cw_balance:,}")
+        print(f"[{self.id}] 📊 Trust: {self.stats.trust_score}/{TRUST_TARGET} | CW: {self.stats.cw_balance:,} | Staked: {self.stats.cw_staked:,}")
 
         consecutive_token_failures = 0
 
@@ -742,6 +775,7 @@ class DashboardServer:
                 "total_accounts": len(self.farmers),
                 "completed": sum(1 for f in self.farmers if f.stats.trust_score >= TRUST_TARGET),
                 "total_cw": sum(f.stats.cw_balance for f in self.farmers),
+                "total_staked": sum(f.stats.cw_staked for f in self.farmers),
                 "total_mines": sum(f.stats.total_mines for f in self.farmers),
                 "avg_trust": sum(f.stats.trust_score for f in self.farmers) / len(self.farmers) if self.farmers else 0,
                 "total_moments": sum(f.stats.moments_posted for f in self.farmers),
@@ -789,7 +823,7 @@ h1 { text-align: center; margin-bottom: 20px; text-shadow: 0 0 10px #00ff00; }
 .trust-fill { height: 100%; background: linear-gradient(90deg,#ff4444,#ffaa00,#00ff00); }
 .summary { background: #0a0a0a; border: 2px solid #00ff00; border-radius: 8px; padding: 20px; margin-bottom: 20px; text-align: center; }
 .summary h2 { color: #00ff00; margin-bottom: 15px; }
-.summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; }
+.summary-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 20px; }
 .summary-item { text-align: center; }
 .summary-value { font-size: 24px; font-weight: bold; color: #00ff00; }
 .summary-label { font-size: 11px; color: #666; }
@@ -811,6 +845,7 @@ async function load() {
    <div class="summary-grid">
     <div class="summary-item"><div class="summary-value">${s.completed}/${s.total_accounts}</div><div class="summary-label">Completed</div></div>
     <div class="summary-item"><div class="summary-value">${s.total_cw.toLocaleString()}</div><div class="summary-label">Total CW</div></div>
+    <div class="summary-item"><div class="summary-value">${s.total_staked.toLocaleString()}</div><div class="summary-label">Total Staked</div></div>
     <div class="summary-item"><div class="summary-value">${s.total_mines}</div><div class="summary-label">Total Mines</div></div>
     <div class="summary-item"><div class="summary-value">${s.avg_trust.toFixed(1)}</div><div class="summary-label">Avg Trust</div></div>
    </div>
@@ -822,6 +857,7 @@ async function load() {
     <div class="stat"><span class="stat-label">Trust</span><span class="stat-value ${a.trust_score>=65?'done':'warn'}">${a.trust_score}/65</span></div>
     <div class="trust-bar"><div class="trust-fill" style="width:${Math.min(100,a.trust_score/65*100)}%"></div></div>
     <div class="stat"><span class="stat-label">CW Balance</span><span class="stat-value">${a.cw_balance.toLocaleString()}</span></div>
+    <div class="stat"><span class="stat-label">Staked</span><span class="stat-value ${a.stake_ok?'done':'warn'}">${a.cw_staked.toLocaleString()} ${a.stake_ok?'✅':'⏳'}</span></div>
     <div class="stat"><span class="stat-label">Mines</span><span class="stat-value">${a.total_mines}</span></div>
     <div class="stat"><span class="stat-label">Moments</span><span class="stat-value">${a.moments_posted}/5</span></div>
     <div class="stat"><span class="stat-label">Challenges</span><span class="stat-value ${a.challenges_failed>0?'warn':'good'}">${a.challenges_passed}/${a.challenges_passed+a.challenges_failed}</span></div>
